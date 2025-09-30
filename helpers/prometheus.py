@@ -1,6 +1,9 @@
+# pylint: disable=consider-using-f-string,logging-format-interpolation
+
 import logging
+import asyncio
 from datetime import datetime, timedelta
-from uuid import uuid4
+from os import getenv
 
 from prometheus_client.core import (
     REGISTRY,
@@ -13,7 +16,10 @@ from helpers.utils import get_cached, write_cache
 
 # constants for caching file
 JSON_CACHE_FILE = "/tmp/sentry-prometheus-exporter-cache.json"
-DEFAULT_CACHE_EXPIRE_TIMESTAMP = int(datetime.timestamp(datetime.now() + timedelta(minutes=2)))
+DEFAULT_CACHE_EXPIRE_TIMESTAMP = int(
+    datetime.timestamp(datetime.now() + timedelta(minutes=2))
+)
+CONCURRENCY = int(getenv("SENTRY_CONCURRENCY", "64"))
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +33,7 @@ def clean_registry():
             pass
 
 
-class SentryCollector(object):
+class SentryCollector:
     """A simple :class:`SentryCollector <SentryCollector>` returns a list of Metric objects.
 
     Proxy metrics from sentry building consistent with the Prometheus exposition formats:
@@ -50,7 +56,6 @@ class SentryCollector(object):
         sentry_projects_slug=None,
     ):
         """Inits SentryCollector with a SentryAPI object"""
-        super(SentryCollector, self).__init__()
         self.__sentry_api = sentry_api
         self.sentry_org_slug = sentry_org_slug
         self.sentry_projects_slug = sentry_projects_slug
@@ -60,6 +65,7 @@ class SentryCollector(object):
         self.get_1h_metrics = metric_scraping_config[3]
         self.get_24h_metrics = metric_scraping_config[4]
         self.get_14d_metrics = metric_scraping_config[5]
+        self.logger = log
 
     def __build_sentry_data_from_api(self):
         """Build a local data structure from sentry API calls.
@@ -102,7 +108,9 @@ class SentryCollector(object):
         projects_envs = {}
         projects = []
         self.org = self.__sentry_api.get_org(self.sentry_org_slug)
-        log.info("metadata: sentry organization: {org}".format(org=self.org.get("slug")))
+        log.info(
+            "metadata: sentry organization: {org}".format(org=self.org.get("slug"))
+        )
 
         if self.sentry_projects_slug:
             log.info(
@@ -112,27 +120,35 @@ class SentryCollector(object):
             )
             for project_slug in self.sentry_projects_slug.split(","):
                 log.debug(
-                    "metadata: getting {proj} project data from API".format(proj=project_slug)
+                    "metadata: getting {proj} project data from API".format(
+                        proj=project_slug
+                    )
                 )
-                project = self.__sentry_api.get_project(self.org.get("slug"), project_slug)
+                project = self.__sentry_api.get_project(
+                    self.org.get("slug"), project_slug
+                )
                 projects.append(project)
                 projects_slug.append(project_slug)
-                envs = self.__sentry_api.environments(self.org.get("slug"), project)
-                projects_envs[project.get("slug")] = envs
+                if self.issue_metrics == "True":
+                    envs = self.__sentry_api.environments(self.org.get("slug"), project)
+                    projects_envs[project.get("slug")] = envs
             log.info(
-                "metadata: projects loaded from API: {num_proj}".format(num_proj=len(projects))
+                "metadata: projects loaded from API: {num_proj}".format(
+                    num_proj=len(projects)
+                )
             )
         else:
-            log.info(
-                "metadata: no projects specified, loading from API".format(num_proj=len(projects))
-            )
+            log.info("metadata: no projects specified, loading from API")
             for project in self.__sentry_api.projects(self.sentry_org_slug):
                 projects.append(project)
                 projects_slug.append(project.get("slug"))
-                envs = self.__sentry_api.environments(self.org.get("slug"), project)
-                projects_envs[project.get("slug")] = envs
+                if self.issue_metrics == "True":
+                    envs = self.__sentry_api.environments(self.org.get("slug"), project)
+                    projects_envs[project.get("slug")] = envs
             log.info(
-                "metadata: projects loaded from API: {num_proj}".format(num_proj=len(projects))
+                "metadata: projects loaded from API: {num_proj}".format(
+                    num_proj=len(projects)
+                )
             )
 
         log.debug("metadata: building projects metadata structure")
@@ -195,7 +211,11 @@ class SentryCollector(object):
             data["projects_data"] = projects_issue_data
 
         write_cache(JSON_CACHE_FILE, data, DEFAULT_CACHE_EXPIRE_TIMESTAMP)
-        log.debug("cache: writing data structure to file: {cache}".format(cache=JSON_CACHE_FILE))
+        log.debug(
+            "cache: writing data structure to file: {cache}".format(
+                cache=JSON_CACHE_FILE
+            )
+        )
         return data
 
     def __build_sentry_data(self):
@@ -208,7 +228,11 @@ class SentryCollector(object):
             api_data = self.__build_sentry_data_from_api()
             return api_data
 
-        log.debug("cache: reading data structure from file: {cache}".format(cache=JSON_CACHE_FILE))
+        log.debug(
+            "cache: reading data structure from file: {cache}".format(
+                cache=JSON_CACHE_FILE
+            )
+        )
         return data
 
     def collect(self):
@@ -358,27 +382,13 @@ class SentryCollector(object):
             yield issues_metrics
 
         if self.events_metrics == "True":
-            project_events_metrics = CounterMetricFamily(
-                "sentry_events",
-                "Total events counts per project",
-                labels=[
-                    "project_slug",
-                    "stat",
-                ],
-            )
 
-            for project in __metadata.get("projects"):
-                events = self.__sentry_api.project_stats(self.org.get("slug"), project.get("slug"))
-                for stat, value in events.items():
-                    project_events_metrics.add_metric(
-                        [
-                            str(project.get("slug")),
-                            str(stat),
-                        ],
-                        int(value),
-                    )
+            def _sync_build():
+                return asyncio.run(self._build_sentry_events_metrics(__metadata))
 
-            yield project_events_metrics
+            project_events_metrics = _sync_build()
+            if project_events_metrics is not None:
+                yield project_events_metrics
 
         if self.rate_limit_metrics == "True":
             project_rate_metrics = GaugeMetricFamily(
@@ -396,3 +406,43 @@ class SentryCollector(object):
                 )
 
             yield project_rate_metrics
+
+    async def _build_sentry_events_metrics(self, __metadata):
+        """
+        Async worker that concurrently calls Sentry for each project,
+        then assembles the CounterMetricFamily exactly as before.
+        Expects self.__sentry_api to be an instance of SentryAsyncAPI.
+        """
+        projects = __metadata.get("projects", [])
+
+        # If there are no projects, short-circuit
+        if not projects:
+            return None
+
+        limiter = asyncio.Semaphore(CONCURRENCY)
+        metric = CounterMetricFamily(
+            "sentry_events",
+            "Total events counts per project",
+            labels=["project_slug", "stat"],
+        )
+
+        async def per_project(project: dict):
+            slug = project.get("slug")
+            events = await self.__sentry_api.project_stats(
+                self.org.get("slug"), slug, limiter=limiter
+            )
+            return slug, events
+
+        results = await asyncio.gather(
+            *(per_project(p) for p in projects), return_exceptions=True
+        )
+
+        for res in results:
+            if isinstance(res, Exception):
+                self.logger.warning("Sentry project_stats failed: %r", res)
+                continue
+            slug, events = res
+            for stat, value in (events or {}).items():
+                metric.add_metric([str(slug), str(stat)], int(value))
+
+        return metric

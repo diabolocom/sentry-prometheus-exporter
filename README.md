@@ -99,6 +99,13 @@ By default, sentry's API will be polled to retrieve all projects. If you wish fo
 export SENTRY_EXPORTER_PROJECTS="project1,project2,project3"
 ```
 
+### Skip project stats
+
+Skip some stats from being computed to make things faster if they are not used
+```sh
+export SENTRY_SKIP_STAT_NAME=blacklisted,rejected
+```
+
 ### Metric Configuration
 
 Excepting rate-limit-events metric, by default all metrics are scraped, however, issue or event-related metrics can be disabled by setting the relevant variable to False:

@@ -37,7 +37,7 @@ logging.basicConfig(
 
 app = Flask(__name__)
 app.register_blueprint(healthz, url_prefix="/healthz")
-app.logger.handlers.extend(gunicorn_error_logger.handlers)
+# app.logger.handlers.extend(gunicorn_error_logger.handlers)
 
 app.config["HEALTHZ"] = {
     "live": "helpers.utils.liveness",
@@ -92,15 +92,24 @@ def home():
     "
 
 
-@app.route("/metrics/")
-@auth.login_required(optional=basic_auth_is_enabled(EXPORTER_BASIC_AUTH))
-def sentry_exporter():
-    sentry = SentryAPI(BASE_URL, AUTH_TOKEN)
-    log.info("exporter: cleaning registry collectors...")
-    clean_registry()
-    REGISTRY.register(SentryCollector(sentry, ORG_SLUG, get_metric_config(), PROJECTS_SLUG))
-    exporter = DispatcherMiddleware(app.wsgi_app, {"/metrics": make_wsgi_app()})
-    return exporter
+sentry = SentryAPI(BASE_URL, AUTH_TOKEN)
+clean_registry()
+REGISTRY.register(SentryCollector(sentry, ORG_SLUG, get_metric_config(), PROJECTS_SLUG))
+
+# Mount the Prometheus WSGI app at /metrics ONCE
+app.wsgi_app = DispatcherMiddleware(
+    app.wsgi_app, {"/metrics": make_wsgi_app()}  # uses global REGISTRY
+)
+
+#   @app.route("/metrics/")
+#   def sentry_exporter():
+#       log.info("-------------")
+#       sentry = SentryAPI(BASE_URL, AUTH_TOKEN)
+#       log.info("exporter: cleaning registry collectors...")
+#       clean_registry()
+#       REGISTRY.register(SentryCollector(sentry, ORG_SLUG, get_metric_config(), PROJECTS_SLUG))
+#       exporter = DispatcherMiddleware(app.wsgi_app, {"/metrics": make_wsgi_app()})
+#       return exporter
 
 
 if __name__ == "__main__":

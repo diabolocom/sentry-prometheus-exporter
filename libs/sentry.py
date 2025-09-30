@@ -1,19 +1,47 @@
+# pylint: disable=consider-using-f-string
+
 from datetime import datetime
 from os import getenv
+import traceback
+import asyncio
+import logging
 
 from retry import retry
 import requests
+import httpx
+
+from libs.httpx_accesslog import on_request, on_response
 
 retry_settings = {
-    "tries": int(getenv("SENTRY_RETRY_TRIES", "3")),
-    "delay": float(getenv("SENTRY_RETRY_DELAY", "1")),
+    "tries": int(getenv("SENTRY_RETRY_TRIES", "5")),
+    "delay": float(getenv("SENTRY_RETRY_DELAY", "0.2")),
     "max_delay": float(getenv("SENTRY_RETRY_MAX_DELAY", "10")),
     "backoff": float(getenv("SENTRY_RETRY_BACKOFF", "2")),
     "jitter": float(getenv("SENTRY_RETRY_JITTER", "0.5")),
 }
 
 
-class SentryAPI(object):
+TRIES = int(getenv("SENTRY_RETRY_TRIES", "5"))
+DELAY = float(getenv("SENTRY_RETRY_DELAY", "0.2"))
+MAX_DELAY = float(getenv("SENTRY_RETRY_MAX_DELAY", "10"))
+BACKOFF = float(getenv("SENTRY_RETRY_BACKOFF", "2"))
+JITTER = float(getenv("SENTRY_RETRY_JITTER", "0.5"))
+
+CONCURRENCY = int(getenv("SENTRY_CONCURRENCY", "32"))
+TIMEOUT = float(getenv("SENTRY_TIMEOUT", "30"))
+
+SKIP_STAT_NAME = getenv("SENTRY_SKIP_STAT_NAME", "").split(",")
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("hpack").setLevel(logging.WARNING)
+logging.getLogger("h2").setLevel(logging.WARNING)
+
+log = logging.getLogger("sentry.async")
+log.setLevel(logging.DEBUG)
+
+
+class SentryAPI:
     """A simple :class:`SentryAPI <SentryAPI>` to interact with Sentry's Web API.
 
     Used to interact with Sentry's API to do basic list operations
@@ -31,10 +59,163 @@ class SentryAPI(object):
 
     def __init__(self, base_url, auth_token):
         """Inits SentryAPI with base sentry's URL and authentication token."""
-        super(SentryAPI, self).__init__()
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/") + "/"
+        self._headers = {"Authorization": f"Bearer {auth_token}"}
         self.__token = auth_token
         self.__session = requests.Session()
+
+    async def _retrying_get(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        limiter: asyncio.Semaphore | None = None,
+    ):
+        """
+        GET with retry/backoff + concurrency guard.
+        Raises if all retries fail.
+        """
+        url = self.base_url + path.lstrip("/")
+        attempt = 0
+        delay = DELAY
+
+        while True:
+            try:
+                if limiter is not None:
+                    async with limiter:
+                        resp = await client.get(url)
+                else:
+                    resp = await client.get(url)
+                resp.raise_for_status()
+                return resp
+            except (asyncio.TimeoutError, httpx.ReadTimeout):
+                log.warning(
+                    "HTTPX TIMEOUT url=%s (attempt %d/%d)",
+                    url,
+                    attempt + 1,
+                    TRIES,
+                    exc_info=True,
+                )
+
+            except httpx.ConnectTimeout:
+                log.warning(
+                    "HTTPX CONNECT TIMEOUT url=%s (attempt %d/%d)",
+                    url,
+                    attempt + 1,
+                    TRIES,
+                    exc_info=True,
+                )
+
+            except httpx.ConnectError as e:
+                cause = repr(getattr(e, "__cause__", None))
+                log.error(
+                    "HTTPX CONNECT ERROR url=%s cause=%s (attempt %d/%d)",
+                    url,
+                    cause,
+                    attempt + 1,
+                    TRIES,
+                    exc_info=True,
+                )
+
+            except httpx.RemoteProtocolError as e:
+                log.error(
+                    "HTTPX PROTOCOL ERROR url=%s (attempt %d/%d)",
+                    url,
+                    attempt + 1,
+                    TRIES,
+                    exc_info=True,
+                )
+
+            except httpx.PoolTimeout as e:
+                log.warning(
+                    "HTTPX POOL TIMEOUT (connection pool exhausted) url=%s (attempt %d/%d)",
+                    url,
+                    attempt + 1,
+                    TRIES,
+                    exc_info=True,
+                )
+
+            except httpx.HTTPStatusError as e:
+                body_preview = e.response.text[:256] if e.response is not None else ""
+                log.error(
+                    "HTTP %s for %s -> %s\nBody: %r",
+                    e.request.method,
+                    e.request.url,
+                    e.response.status_code if e.response else "?",
+                    body_preview,
+                )
+                raise
+
+            except Exception as e:
+                log.error(
+                    "HTTPX UNKNOWN ERROR url=%s type=%s (attempt %d/%d)\n%s",
+                    url,
+                    type(e).__name__,
+                    attempt + 1,
+                    TRIES,
+                    "".join(traceback.format_exception(type(e), e, e.__traceback__)),
+                )
+
+            attempt += 1
+            if attempt >= TRIES:
+                raise Exception("Attempted too many times")
+            jitter = (2 * JITTER) * (asyncio.get_running_loop().time() % 1) - JITTER
+            sleep_for = max(0.0, min(MAX_DELAY, delay) + jitter)
+            await asyncio.sleep(sleep_for)
+            delay *= BACKOFF
+
+    async def project_stats(
+        self,
+        org_slug: str,
+        project_slug: str,
+        *,
+        limiter: asyncio.Semaphore | None = None,
+    ) -> dict:
+        """
+        Retrieve and reduce monthly event counts for a project.
+        Exactly same aggregation/business logic as your sync version.
+        """
+        first_day_month = int(datetime.today().replace(day=1).timestamp())
+        today = int(datetime.today().timestamp())
+        default_stat_names = ["received", "rejected", "blacklisted"]
+        stat_names = []
+        for stat_name in default_stat_names:
+            if stat_name not in SKIP_STAT_NAME:
+                stat_names.append(stat_name)
+        timeout = httpx.Timeout(TIMEOUT, connect=min(10.0, TIMEOUT))
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            headers=self._headers,
+            limits=httpx.Limits(
+                max_connections=CONCURRENCY,
+                max_keepalive_connections=CONCURRENCY,
+            ),
+            event_hooks={
+                "request": [on_request],
+                "response": [on_response],
+            },
+        ) as client:
+
+            async def fetch_one(stat_name: str):
+                r = await self._retrying_get(
+                    client,
+                    f"projects/{org_slug}/{project_slug}/stats/"
+                    f"?stat={stat_name}&since={first_day_month}&until={today}",
+                    limiter=limiter,
+                )
+                return stat_name, r.json()
+
+            pairs = await asyncio.gather(*(fetch_one(s) for s in stat_names))
+            series = dict(pairs)
+
+        project_events = {}
+        for stat_name, values in series.items():
+            events = 0
+            for point in values:
+                if not isinstance(point, str):
+                    events += point[1]
+            project_events[stat_name] = events
+
+        return project_events
 
     @retry(requests.exceptions.HTTPError, **retry_settings)
     def __get(self, url):
@@ -42,9 +223,6 @@ class SentryAPI(object):
         response = self.__session.get(self.base_url + url, headers=HEADERS)
         response.raise_for_status()
         return response
-
-    def __post(self, url):
-        raise NotImplementedError
 
     def organizations(self):
         """Return a list of organizations."""
@@ -103,7 +281,9 @@ class SentryAPI(object):
             A list mapping with dictionary keys to the corresponding projects
         """
 
-        resp = self.__get("organizations/{org}/projects/?all_projects=1".format(org=org_slug))
+        resp = self.__get(
+            "organizations/{org}/projects/?all_projects=1".format(org=org_slug)
+        )
         projects = []
         for proj in resp.json():
             project = {}
@@ -147,49 +327,6 @@ class SentryAPI(object):
         )
 
         return project
-
-    def project_stats(self, org_slug, project_slug):
-        """Retrieve event counts for a project
-
-        Return a set of points representing a normalized timestamp
-        and the number of events seen in the period.
-
-        Query ranges are limited to Sentry's configured time-series resolutions.
-
-        Args:
-            org_slug: A organization's slug string name.
-            project_slug: The project's slug string name
-
-        Returns:
-            A dict([list])
-        """
-
-        first_day_month = datetime.timestamp(datetime.today().replace(day=1))
-        today = datetime.timestamp(datetime.today())
-        stat_names = ["received", "rejected", "blacklisted"]
-        stats = {}
-        project_events = {}
-
-        for stat_name in stat_names:
-            resp = self.__get(
-                "projects/{org}/{proj_slug}/stats/?stat={stat}&since={since}&until={until}".format(
-                    org=org_slug,
-                    proj_slug=project_slug,
-                    stat=stat_name,
-                    since=first_day_month,
-                    until=today,
-                )
-            )
-            stats[stat_name] = resp.json()
-
-        for stat_name, values in stats.items():
-            events = 0
-            for stat in values:
-                if type(stat) != str:
-                    events += stat[1]
-            project_events[stat_name] = events
-
-        return project_events
 
     def environments(self, org_slug, project):
         """Return a list of project's environments.
@@ -258,9 +395,8 @@ class SentryAPI(object):
             else:
                 issues[environment] = resp.json()
             return issues
-        else:
-            resp = self.__get(issues_url)
-            return {"all": resp.json()}
+        resp = self.__get(issues_url)
+        return {"all": resp.json()}
 
     def events(self, org_slug, project, environment=None):
         """Return a list of events bound to a project.
@@ -283,8 +419,10 @@ class SentryAPI(object):
         if not isinstance(project, dict):
             raise TypeError("project param isn't a dictionary")
 
-        events_url = "projects/{org}/{proj_slug}/events/?project={proj_id}&sort=date".format(
-            org=org_slug, proj_slug=project.get("slug"), proj_id=project.get("id")
+        events_url = (
+            "projects/{org}/{proj_slug}/events/?project={proj_id}&sort=date".format(
+                org=org_slug, proj_slug=project.get("slug"), proj_id=project.get("id")
+            )
         )
         if environment:
             events = {}
@@ -292,9 +430,8 @@ class SentryAPI(object):
             resp = self.__get(events_url)
             events[environment] = resp.json()
             return events
-        else:
-            resp = self.__get(events_url)
-            return {"all": resp.json()}
+        resp = self.__get(events_url)
+        return {"all": resp.json()}
 
     def issue_events(self, issue_id, environment=None):
         """This method lists issue's events."""
@@ -309,28 +446,29 @@ class SentryAPI(object):
             resp = self.__get(issue_events_url)
             issue_events[environment] = resp.json()
             return issue_events
-        else:
-            resp = self.__get(issue_events_url)
-            return {"all": resp.json()}
+        resp = self.__get(issue_events_url)
+        return {"all": resp.json()}
 
     def issue_release(self, issue_id, environment=None):
         """This method lists issue's events."""
 
-        issue_release_url = "issues/{issue_id}/current-release/".format(issue_id=issue_id)
+        issue_release_url = "issues/{issue_id}/current-release/".format(
+            issue_id=issue_id
+        )
 
         if environment:
-            issue_release_url = issue_release_url + "?environment={env}".format(env=environment)
+            issue_release_url = issue_release_url + "?environment={env}".format(
+                env=environment
+            )
             resp = self.__get(issue_release_url)
             curr_release = resp.json().get("currentRelease")
             if curr_release:
                 release = curr_release.get("release").get("version")
                 return release
-            else:
-                return curr_release
-        else:
-            resp = self.__get(issue_release_url)
-            release = resp.json().get("currentRelease").get("release").get("version")
-            return release
+            return curr_release
+        resp = self.__get(issue_release_url)
+        release = resp.json().get("currentRelease").get("release").get("version")
+        return release
 
     def project_releases(self, org_slug, project, environment=None):
         """Return a list of releases for a given project into the organization.
@@ -351,19 +489,22 @@ class SentryAPI(object):
         if not isinstance(project, dict):
             raise TypeError("project param isn't a dictionary")
 
-        proj_releases_url = "organizations/{org}/releases/?project={proj_id}&sort=date".format(
-            org=org_slug, proj_id=project.get("id")
+        proj_releases_url = (
+            "organizations/{org}/releases/?project={proj_id}&sort=date".format(
+                org=org_slug, proj_id=project.get("id")
+            )
         )
 
         if environment:
             proj_releases = {}
-            proj_releases_url = proj_releases_url + "&environment={env}".format(env=environment)
+            proj_releases_url = proj_releases_url + "&environment={env}".format(
+                env=environment
+            )
             resp = self.__get(proj_releases_url)
             proj_releases[environment] = resp.json()
             return proj_releases
-        else:
-            resp = self.__get(proj_releases_url)
-            return {"all": resp.json()}
+        resp = self.__get(proj_releases_url)
+        return {"all": resp.json()}
 
     def rate_limit(self, org_slug, project_slug):
         """Return client key rate limits configuration on an individual project.

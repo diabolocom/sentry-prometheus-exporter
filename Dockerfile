@@ -1,4 +1,4 @@
-FROM python:3.7-slim
+FROM python:3.13-slim
 LABEL maintainer="Italo Santos <italux.santos@gmail.com>"
 LABEL description="Sentry Issues & Events Exporter"
 
@@ -16,4 +16,4 @@ USER nobody
 # The binding port was picked from the Default port allocations documentation:
 # https://github.com/prometheus/prometheus/wiki/Default-port-allocations
 EXPOSE 9790
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:9790", "exporter:app"]
+CMD ["gunicorn", "-w", "8", "--timeout", "600", "-b", "[::]:9790", "exporter:app"]

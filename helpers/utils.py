@@ -30,7 +30,9 @@ def get_cached(filename):
     if os.path.isfile(filename):
         cache = json.load(open(filename, "r"))
         if cache.get("expire_at") <= datetime.timestamp(datetime.now()):
-            log.debug("cache: expired data, removing cache file: {file}".format(file=filename))
+            log.debug(
+                "cache: expired data, removing cache file: {file}".format(file=filename)
+            )
             return False
         return cache
     else:
@@ -39,7 +41,9 @@ def get_cached(filename):
 
 def liveness():
     """Return True if the application is running properly"""
-    return True  # TODO - Can't find a good way to validate if the app is running properly
+    return (
+        True  # TODO - Can't find a good way to validate if the app is running properly
+    )
 
 
 def readiness():
