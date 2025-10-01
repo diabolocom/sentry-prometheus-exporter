@@ -1,10 +1,12 @@
 # pylint: disable=consider-using-f-string
 
-from datetime import datetime
+from datetime import datetime, timezone
 from os import getenv
 import traceback
 import asyncio
 import logging
+from typing import List, Dict, Optional, Tuple
+from urllib.parse import urlencode
 
 from retry import retry
 import requests
@@ -171,11 +173,9 @@ class SentryAPI:
         limiter: asyncio.Semaphore | None = None,
     ) -> dict:
         """
-        Retrieve and reduce monthly event counts for a project.
-        Exactly same aggregation/business logic as your sync version.
+        Retrieve and reduce last hour events
         """
-        first_day_month = int(datetime.today().replace(day=1).timestamp())
-        today = int(datetime.today().timestamp())
+        now = int(datetime.today().timestamp())
         default_stat_names = ["received", "rejected", "blacklisted"]
         stat_names = []
         for stat_name in default_stat_names:
@@ -199,7 +199,7 @@ class SentryAPI:
                 r = await self._retrying_get(
                     client,
                     f"projects/{org_slug}/{project_slug}/stats/"
-                    f"?stat={stat_name}&since={first_day_month}&until={today}",
+                    f"?stat={stat_name}&since={now - 3600}&until={now}&resolution=1h",
                     limiter=limiter,
                 )
                 return stat_name, r.json()
@@ -219,8 +219,8 @@ class SentryAPI:
 
     @retry(requests.exceptions.HTTPError, **retry_settings)
     def __get(self, url):
-        HEADERS = {"Authorization": "Bearer " + self.__token}
-        response = self.__session.get(self.base_url + url, headers=HEADERS)
+        headers = {"Authorization": "Bearer " + self.__token}
+        response = self.__session.get(self.base_url + url, headers=headers)
         response.raise_for_status()
         return response
 
@@ -529,3 +529,146 @@ class SentryAPI:
             rate_limit_second = 0
 
         return rate_limit_second
+
+    async def _org_stats_v2_last_hour(
+        self,
+        org_slug: str,
+        *,
+        group_key: str,  # "outcome" or "reason"
+        field: str,  # "sum(quantity)" or "sum(times_seen)"
+        limiter: asyncio.Semaphore | None = None,
+    ) -> dict:
+        """
+        Low-level helper: one call to stats_v2 for the last hour with:
+          - field=<field>
+          - groupBy=category & groupBy=<group_key>
+          - start=<epoch secs one hour ago>, end=<epoch secs now>, resolution=1h
+        Returns parsed JSON.
+        """
+        now = int(datetime.now(timezone.utc).timestamp())
+        start = now - 3600
+
+        # Build query with repeated keys
+        params = [
+            ("field", field),
+            ("groupBy", "category"),
+            ("groupBy", group_key),
+            ("start", str(start)),
+            ("end", str(now)),
+            ("resolution", "1h"),
+        ]
+        query = urlencode(params, doseq=True)
+        path = f"organizations/{org_slug}/stats_v2/?{query}"
+
+        timeout = httpx.Timeout(TIMEOUT, connect=min(10.0, TIMEOUT))
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            headers=self._headers,
+            limits=httpx.Limits(
+                max_connections=CONCURRENCY,
+                max_keepalive_connections=CONCURRENCY,
+            ),
+            event_hooks={
+                "request": [on_request],
+                "response": [on_response],
+            },
+        ) as client:
+            if limiter is not None:
+                async with limiter:
+                    resp = await client.get(self.base_url + path.lstrip("/"))
+            else:
+                resp = await client.get(self.base_url + path.lstrip("/"))
+            resp.raise_for_status()
+            return resp.json()
+
+    def _merge_stats_v2_groups(
+        self,
+        *,
+        data_qty: dict,
+        data_seen: dict,
+        group_key: str,  # "outcome" or "reason"
+    ) -> List[Dict[str, Optional[str]]]:
+        """
+        Merge two stats_v2 payloads (quantity & times_seen) keyed by (category, group_key).
+        Produces rows: {"category": str|None, group_key: str|None, "sum_quantity": int, "sum_times_seen": int}
+        """
+
+        def extract_totals(d: dict) -> Dict[Tuple[Optional[str], Optional[str]], int]:
+            out: Dict[Tuple[Optional[str], Optional[str]], int] = {}
+            for g in (d or {}).get("groups", []) or []:
+                by = g.get("by") or {}
+                cat = by.get("category")
+                grp = by.get(group_key)
+                totals = g.get("totals") or {}
+                val = totals.get("sum(quantity)") or totals.get("sum(times_seen)")
+                if val is None:
+                    # fall back to series (single bucket for 1h/1h)
+                    series = g.get("series") or {}
+                    # choose the matching field if present
+                    fld = (
+                        "sum(quantity)"
+                        if "sum(quantity)" in series
+                        else "sum(times_seen)"
+                    )
+                    arr = series.get(fld) or []
+                    val = int(arr[-1]) if arr else 0
+                out[(cat, grp)] = int(val)
+            return out
+
+        qty_map = extract_totals(data_qty)  # (cat, grp) -> quantity
+        seen_map = extract_totals(data_seen)  # (cat, grp) -> times_seen
+
+        keys = set(qty_map.keys()) | set(seen_map.keys())
+        rows: List[Dict[str, Optional[str]]] = []
+        for cat, grp in keys:
+            rows.append(
+                {
+                    "category": cat,
+                    group_key: grp,
+                    "sum_quantity": int(qty_map.get((cat, grp), 0)),
+                    "sum_times_seen": int(seen_map.get((cat, grp), 0)),
+                }
+            )
+        return rows
+
+    async def organization_event_counts_last_hour_by_outcome(
+        self,
+        org_slug: str,
+        *,
+        limiter: asyncio.Semaphore | None = None,
+    ) -> List[Dict[str, Optional[str]]]:
+        """
+        High-level: return rows merged for groupBy=category+outcome with both fields.
+        """
+        qty, seen = await asyncio.gather(
+            self._org_stats_v2_last_hour(
+                org_slug, group_key="outcome", field="sum(quantity)", limiter=limiter
+            ),
+            self._org_stats_v2_last_hour(
+                org_slug, group_key="outcome", field="sum(times_seen)", limiter=limiter
+            ),
+        )
+        return self._merge_stats_v2_groups(
+            data_qty=qty, data_seen=seen, group_key="outcome"
+        )
+
+    async def organization_event_counts_last_hour_by_reason(
+        self,
+        org_slug: str,
+        *,
+        limiter: asyncio.Semaphore | None = None,
+    ) -> List[Dict[str, Optional[str]]]:
+        """
+        High-level: return rows merged for groupBy=category+reason with both fields.
+        """
+        qty, seen = await asyncio.gather(
+            self._org_stats_v2_last_hour(
+                org_slug, group_key="reason", field="sum(quantity)", limiter=limiter
+            ),
+            self._org_stats_v2_last_hour(
+                org_slug, group_key="reason", field="sum(times_seen)", limiter=limiter
+            ),
+        )
+        return self._merge_stats_v2_groups(
+            data_qty=qty, data_seen=seen, group_key="reason"
+        )

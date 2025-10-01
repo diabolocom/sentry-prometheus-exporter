@@ -13,6 +13,7 @@ from prometheus_client.core import (
 )
 
 from helpers.utils import get_cached, write_cache
+from helpers.filecache import FileCachePickleSingleFlight
 
 # constants for caching file
 JSON_CACHE_FILE = "/tmp/sentry-prometheus-exporter-cache.json"
@@ -20,6 +21,11 @@ DEFAULT_CACHE_EXPIRE_TIMESTAMP = int(
     datetime.timestamp(datetime.now() + timedelta(minutes=2))
 )
 CONCURRENCY = int(getenv("SENTRY_CONCURRENCY", "64"))
+
+
+CACHE_DIR = getenv("SENTRY_EXPORTER_CACHE_DIR", "/tmp/sentry_exporter_cache")
+CACHE_TTL = int(getenv("SENTRY_EXPORTER_CACHE_TTL", "30"))  # seconds
+CACHE_STALE = getenv("SENTRY_EXPORTER_CACHE_STALE_ON_ERROR", "True") == "True"
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +72,11 @@ class SentryCollector:
         self.get_24h_metrics = metric_scraping_config[4]
         self.get_14d_metrics = metric_scraping_config[5]
         self.logger = log
+
+        key = "sentry_snapshot"
+        self._cache = FileCachePickleSingleFlight(
+            CACHE_DIR, key, CACHE_TTL, allow_stale_on_error=CACHE_STALE
+        )
 
     def __build_sentry_data_from_api(self):
         """Build a local data structure from sentry API calls.
@@ -237,7 +248,17 @@ class SentryCollector:
 
     def collect(self):
         """Yields metrics from the collectors in the registry."""
+        try:
+            metric_families = self._cache.get_or_compute(
+                lambda: list(self._compute_metrics_once())
+            )
+        except Exception:
+            log.exception("snapshot compute failed; no cache to serve")
+            return  # yield nothing this scrape
 
+        yield from metric_families
+
+    def _compute_metrics_once(self):
         __data = self.__build_sentry_data()
         __metadata = __data.get("metadata")
         __projects_data = __data.get("projects_data")
@@ -380,6 +401,16 @@ class SentryCollector:
                             int(issue.get("count")),
                         )
             yield issues_metrics
+        for builder in (
+            self._build_sentry_org_events_last_hour_by_outcome_metrics,
+            self._build_sentry_org_events_last_hour_by_reason_metrics,
+        ):
+            try:
+                metrics = asyncio.run(builder(__metadata))
+                yield from (metrics or [])
+            except Exception as e:
+                if hasattr(self, "logger"):
+                    self.logger.warning("org-level stats builder failed: %r", e)
 
         if self.events_metrics == "True":
 
@@ -421,7 +452,7 @@ class SentryCollector:
 
         limiter = asyncio.Semaphore(CONCURRENCY)
         metric = CounterMetricFamily(
-            "sentry_events",
+            "sentry_events_last_hour",
             "Total events counts per project",
             labels=["project_slug", "stat"],
         )
@@ -446,3 +477,69 @@ class SentryCollector:
                 metric.add_metric([str(slug), str(stat)], int(value))
 
         return metric
+
+    async def _build_sentry_org_events_last_hour_by_outcome_metrics(self, __metadata):
+        org_slug = (self.org or {}).get("slug") or (__metadata.get("org") or {}).get(
+            "slug"
+        )
+        if not org_slug:
+            return []
+
+        limiter = asyncio.Semaphore(CONCURRENCY)
+        rows = await self.__sentry_api.organization_event_counts_last_hour_by_outcome(
+            org_slug, limiter=limiter
+        )
+
+        m_qty = CounterMetricFamily(
+            "sentry_org_events_last_hour_quantity_by_outcome",
+            "Org sum(quantity) over last hour grouped by category,outcome "
+            "(bytes for attachments; event counts for most categories).",
+            labels=["category", "outcome"],
+        )
+        m_seen = CounterMetricFamily(
+            "sentry_org_events_last_hour_times_seen_by_outcome",
+            "Org sum(times_seen) over last hour grouped by category,outcome "
+            "(unique sessions for sessions; attachment count for attachments).",
+            labels=["category", "outcome"],
+        )
+
+        for r in rows:
+            cat = str(r.get("category") or "null")
+            out = str(r.get("outcome") or "null")
+            m_qty.add_metric([cat, out], int(r.get("sum_quantity", 0)))
+            m_seen.add_metric([cat, out], int(r.get("sum_times_seen", 0)))
+
+        return [m_qty, m_seen]
+
+    async def _build_sentry_org_events_last_hour_by_reason_metrics(self, __metadata):
+        org_slug = (self.org or {}).get("slug") or (__metadata.get("org") or {}).get(
+            "slug"
+        )
+        if not org_slug:
+            return []
+
+        limiter = asyncio.Semaphore(CONCURRENCY)
+        rows = await self.__sentry_api.organization_event_counts_last_hour_by_reason(
+            org_slug, limiter=limiter
+        )
+
+        m_qty = CounterMetricFamily(
+            "sentry_org_events_last_hour_quantity_by_reason",
+            "Org sum(quantity) over last hour grouped by category,reason "
+            "(bytes for attachments; event counts for most categories).",
+            labels=["category", "reason"],
+        )
+        m_seen = CounterMetricFamily(
+            "sentry_org_events_last_hour_times_seen_by_reason",
+            "Org sum(times_seen) over last hour grouped by category,reason "
+            "(unique sessions for sessions; attachment count for attachments).",
+            labels=["category", "reason"],
+        )
+
+        for r in rows:
+            cat = str(r.get("category") or "null")
+            rsn = str(r.get("reason") or "null")
+            m_qty.add_metric([cat, rsn], int(r.get("sum_quantity", 0)))
+            m_seen.add_metric([cat, rsn], int(r.get("sum_times_seen", 0)))
+
+        return [m_qty, m_seen]
